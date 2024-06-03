@@ -170,6 +170,7 @@ OPTION( subsumemineff,   1e6,  0,2e9,1,0,1, "minimum subsuming efficiency") \
 OPTION( subsumeocclim,   1e2,  0,2e9,1,0,1, "watch list length limit") \
 OPTION( subsumereleff,   1e3,  1,1e5,1,0,1, "relative efficiency per mille") \
 OPTION( subsumestr,        1,  0,  1,0,0,1, "strengthen during subsume") \
+OPTION( symmetry,          1,  0,  1,0,0,1, "symmetry detection") \
 OPTION( target,            1,  0,  2,0,0,1, "target phases (1=stable only)") \
 OPTION( terminateint,     10,  0,1e4,0,0,1, "termination check interval") \
 OPTION( ternary,           1,  0,  1,0,1,1, "hyper ternary resolution") \
