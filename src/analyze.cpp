@@ -850,6 +850,223 @@ void Internal::otfs_strengthen_clause (Clause *c, int lit, int new_size,
 
 /*------------------------------------------------------------------------*/
 
+// Analyze 1st UIP cut
+
+Clause *Internal::fst_uip_cut () {
+
+  // First derive the 1st UIP clause by going over literals assigned on the
+  // current decision level.  Literals in the conflict are marked as 'seen'
+  // as well as all literals in reason clauses of already 'seen' literals on
+  // the current decision level.  Thus the outer loop starts with the
+  // conflict clause as 'reason' and then uses the 'reason' of the next
+  // seen literal on the trail assigned on the current decision level.
+  // During this process maintain the number 'open' of seen literals on the
+  // current decision level with not yet processed 'reason'.  As soon 'open'
+  // drops to one, we have found the first unique implication point.  This
+  // is sound because the topological order in which literals are processed
+  // follows the assignment order and a more complex algorithm to find
+  // articulation points is not necessary.
+  //
+  Clause *reason = conflict;
+  LOG (reason, "analyzing conflict");
+
+  assert (clause.empty ());
+  assert (lrat_chain.empty ());
+
+  const auto &t = &trail;
+  int i = t->size ();      // Start at end-of-trail.
+  int open = 0;            // Seen but not processed on this level.
+  int uip = 0;             // The first UIP literal.
+  int resolvent_size = 0;  // without the uip
+  int antecedent_size = 1; // with the uip and without unit literals
+  int conflict_size =
+      0; // size of the conflict without the uip and without unit literals
+  int resolved = 0; // number of resolution (0 = clause in CNF)
+  const bool otfs = opts.otfs;
+
+  for (;;) {
+    antecedent_size = 1; // for uip
+    analyze_reason (uip, reason, open, resolvent_size, antecedent_size);
+    if (resolved == 0)
+      conflict_size = antecedent_size - 1;
+    assert (resolvent_size == open + (int) clause.size ());
+
+    if (otfs && resolved > 0 && antecedent_size > 2 &&
+        resolvent_size < antecedent_size) {
+      assert (reason != conflict);
+      LOG (analyzed, "found candidate for OTFS conflict");
+      LOG (reason, "found candidate (size %d) for OTFS resolvent",
+           antecedent_size);
+      reason = on_the_fly_strengthen (reason, uip);
+      assert (conflict_size >= 2);
+      if (opts.bump)
+        bump_variables ();
+
+      if (resolved == 1 && resolvent_size < conflict_size) {
+        // in this case both clauses are part of the CNF, so one subsumes
+        // the other
+        otfs_subsume_clause (reason, conflict);
+        LOG (reason, "changing conflict to");
+        --conflict_size;
+        assert (conflict_size == reason->size);
+        ++stats.otfs.subsumed;
+        ++stats.subsumed;
+        ++stats.conflicts;
+      }
+
+      LOG (reason, "changing conflict to");
+      conflict = reason;
+      if (open == 1) {
+        int forced = 0;
+        const int conflict_level = otfs_find_backtrack_level (forced);
+        int new_level = determine_actual_backtrack_level (conflict_level);
+        UPDATE_AVERAGE (averages.current.level, new_level);
+        backtrack (new_level);
+
+        LOG ("forcing %d", forced);
+        search_assign_driving (forced, conflict);
+
+        conflict = 0;
+        // Clean up.
+        //
+        clear_analyzed_literals ();
+        clear_analyzed_levels ();
+        clause.clear ();
+        return 0;
+      }
+
+      resolved = 0;
+      clear_analyzed_literals ();
+      // clear_analyzed_levels (); not needed because marking the exact same
+      // again
+      clause.clear ();
+      resolvent_size = 0;
+      antecedent_size = 1;
+      open = 0;
+      analyze_reason (0, reason, open, resolvent_size, antecedent_size);
+      conflict_size = antecedent_size - 1;
+      assert (open > 1);
+    }
+
+    ++resolved;
+
+    uip = 0;
+    while (!uip) {
+      assert (i > 0);
+      const int lit = (*t)[--i];
+      if (!flags (lit).seen)
+        continue;
+      if (var (lit).level == level)
+        uip = lit;
+    }
+    if (!--open)
+      break;
+    reason = var (uip).reason;
+    assert (reason != external_reason);
+    LOG (reason, "analyzing %d reason", uip);
+    assert (resolvent_size);
+    --resolvent_size;
+  }
+  LOG ("first UIP %d", uip);
+  clause.push_back (-uip);
+
+    // Update glue and learned (1st UIP literals) statistics.
+  //
+  int size = (int) clause.size ();
+  const int glue = (int) levels.size () - 1;
+  LOG (clause, "1st UIP size %d and glue %d clause", size, glue);
+  UPDATE_AVERAGE (averages.current.glue.fast, glue);
+  UPDATE_AVERAGE (averages.current.glue.slow, glue);
+  stats.learned.literals += size;
+  stats.learned.clauses++;
+  assert (glue < size);
+
+  // up to this point lrat_chain contains the proof for current clause in
+  // reversed order. in minimize and shrink the clause is changed and
+  // therefore lrat_chain has to be extended. Unfortunately we cannot create
+  // the chain directly during minimazation (or shrinking) but afterwards we
+  // can calculate it pretty easily and even better the same algorithm works
+  // for both shrinking and minimization.
+
+  // Minimize the 1st UIP clause as pioneered by Niklas Soerensson in
+  // MiniSAT and described in our joint SAT'09 paper.
+  //
+  if (size > 1) {
+    if (opts.shrink)
+      shrink_and_minimize_clause ();
+    else if (opts.minimize)
+      minimize_clause ();
+
+    size = (int) clause.size ();
+
+    // Update decision heuristics.
+    //
+    if (opts.bump)
+      bump_variables ();
+
+    if (external->learner)
+      external->export_learned_large_clause (clause);
+  } else if (external->learner)
+    external->export_learned_unit_clause (-uip);
+
+  // Update actual size statistics.
+  //
+  stats.units += (size == 1);
+  stats.binaries += (size == 2);
+  UPDATE_AVERAGE (averages.current.size, size);
+
+  // reverse lrat_chain. We could probably work with reversed iterators
+  // (views) to be more efficient but we would have to distinguish in proof
+  //
+  if (lrat) {
+    LOG (unit_chain, "unit chain: ");
+    for (auto id : unit_chain)
+      lrat_chain.push_back (id);
+    unit_chain.clear ();
+    reverse (lrat_chain.begin (), lrat_chain.end ());
+  }
+
+  // Determine back-jump level, learn driving clause, backtrack and assign
+  // flipped 1st UIP literal.
+  //
+  int jump;
+  Clause *driving_clause = new_driving_clause (glue, jump);
+  UPDATE_AVERAGE (averages.current.jump, jump);
+
+  int new_level = determine_actual_backtrack_level (jump);
+  UPDATE_AVERAGE (averages.current.level, new_level);
+  backtrack (new_level);
+
+  // It should hold that (!level <=> size == 1)
+  //                 and (!uip   <=> size == 0)
+  // this means either we have already learned a clause => size >= 2
+  // in this case we will not learn empty clause or unit here
+  // or we haven't actually learned a clause in new_driving_clause
+  // then lrat_chain is still valid and we will learn a unit or empty clause
+  //
+  if (uip) {
+    search_assign_driving (-uip, driving_clause);
+  } else
+    learn_empty_clause ();
+
+  if (stable)
+    reluctant.tick (); // Reluctant has its own 'conflict' counter.
+
+  // Clean up.
+  //
+  clear_analyzed_literals ();
+  clear_unit_analyzed_literals ();
+  clear_analyzed_levels ();
+  clause.clear ();
+  conflict = 0;
+
+  lrat_chain.clear ();
+
+  return driving_clause;
+}
+
+/*------------------------------------------------------------------------*/
+
 // This is the main conflict analysis routine.  It assumes that a conflict
 // was found.  Then we derive the 1st UIP clause, optionally minimize it,
 // add it as learned clause, and then uses the clause for conflict directed
@@ -947,214 +1164,14 @@ void Internal::analyze () {
 
   /*----------------------------------------------------------------------*/
 
-  // First derive the 1st UIP clause by going over literals assigned on the
-  // current decision level.  Literals in the conflict are marked as 'seen'
-  // as well as all literals in reason clauses of already 'seen' literals on
-  // the current decision level.  Thus the outer loop starts with the
-  // conflict clause as 'reason' and then uses the 'reason' of the next
-  // seen literal on the trail assigned on the current decision level.
-  // During this process maintain the number 'open' of seen literals on the
-  // current decision level with not yet processed 'reason'.  As soon 'open'
-  // drops to one, we have found the first unique implication point.  This
-  // is sound because the topological order in which literals are processed
-  // follows the assignment order and a more complex algorithm to find
-  // articulation points is not necessary.
-  //
-  Clause *reason = conflict;
-  LOG (reason, "analyzing conflict");
+  Clause *driving_clause;
 
-  assert (clause.empty ());
-  assert (lrat_chain.empty ());
-
-  const auto &t = &trail;
-  int i = t->size ();      // Start at end-of-trail.
-  int open = 0;            // Seen but not processed on this level.
-  int uip = 0;             // The first UIP literal.
-  int resolvent_size = 0;  // without the uip
-  int antecedent_size = 1; // with the uip and without unit literals
-  int conflict_size =
-      0; // size of the conflict without the uip and without unit literals
-  int resolved = 0; // number of resolution (0 = clause in CNF)
-  const bool otfs = opts.otfs;
-
-  for (;;) {
-    antecedent_size = 1; // for uip
-    analyze_reason (uip, reason, open, resolvent_size, antecedent_size);
-    if (resolved == 0)
-      conflict_size = antecedent_size - 1;
-    assert (resolvent_size == open + (int) clause.size ());
-
-    if (otfs && resolved > 0 && antecedent_size > 2 &&
-        resolvent_size < antecedent_size) {
-      assert (reason != conflict);
-      LOG (analyzed, "found candidate for OTFS conflict");
-      LOG (reason, "found candidate (size %d) for OTFS resolvent",
-           antecedent_size);
-      reason = on_the_fly_strengthen (reason, uip);
-      assert (conflict_size >= 2);
-      if (opts.bump)
-        bump_variables ();
-
-      if (resolved == 1 && resolvent_size < conflict_size) {
-        // in this case both clauses are part of the CNF, so one subsumes
-        // the other
-        otfs_subsume_clause (reason, conflict);
-        LOG (reason, "changing conflict to");
-        --conflict_size;
-        assert (conflict_size == reason->size);
-        ++stats.otfs.subsumed;
-        ++stats.subsumed;
-        ++stats.conflicts;
-      }
-
-      LOG (reason, "changing conflict to");
-      conflict = reason;
-      if (open == 1) {
-        int forced = 0;
-        const int conflict_level = otfs_find_backtrack_level (forced);
-        int new_level = determine_actual_backtrack_level (conflict_level);
-        UPDATE_AVERAGE (averages.current.level, new_level);
-        backtrack (new_level);
-
-        LOG ("forcing %d", forced);
-        search_assign_driving (forced, conflict);
-
-        conflict = 0;
-        // Clean up.
-        //
-        clear_analyzed_literals ();
-        clear_analyzed_levels ();
-        clause.clear ();
-        STOP (analyze);
-        return;
-      }
-
-      resolved = 0;
-      clear_analyzed_literals ();
-      // clear_analyzed_levels (); not needed because marking the exact same
-      // again
-      clause.clear ();
-      resolvent_size = 0;
-      antecedent_size = 1;
-      open = 0;
-      analyze_reason (0, reason, open, resolvent_size, antecedent_size);
-      conflict_size = antecedent_size - 1;
-      assert (open > 1);
-    }
-
-    ++resolved;
-
-    uip = 0;
-    while (!uip) {
-      assert (i > 0);
-      const int lit = (*t)[--i];
-      if (!flags (lit).seen)
-        continue;
-      if (var (lit).level == level)
-        uip = lit;
-    }
-    if (!--open)
-      break;
-    reason = var (uip).reason;
-    assert (reason != external_reason);
-    LOG (reason, "analyzing %d reason", uip);
-    assert (resolvent_size);
-    --resolvent_size;
-  }
-  LOG ("first UIP %d", uip);
-  clause.push_back (-uip);
-
-  // Update glue and learned (1st UIP literals) statistics.
-  //
-  int size = (int) clause.size ();
-  const int glue = (int) levels.size () - 1;
-  LOG (clause, "1st UIP size %d and glue %d clause", size, glue);
-  UPDATE_AVERAGE (averages.current.glue.fast, glue);
-  UPDATE_AVERAGE (averages.current.glue.slow, glue);
-  stats.learned.literals += size;
-  stats.learned.clauses++;
-  assert (glue < size);
-
-  // up to this point lrat_chain contains the proof for current clause in
-  // reversed order. in minimize and shrink the clause is changed and
-  // therefore lrat_chain has to be extended. Unfortunately we cannot create
-  // the chain directly during minimazation (or shrinking) but afterwards we
-  // can calculate it pretty easily and even better the same algorithm works
-  // for both shrinking and minimization.
-
-  // Minimize the 1st UIP clause as pioneered by Niklas Soerensson in
-  // MiniSAT and described in our joint SAT'09 paper.
-  //
-  if (size > 1) {
-    if (opts.shrink)
-      shrink_and_minimize_clause ();
-    else if (opts.minimize)
-      minimize_clause ();
-
-    size = (int) clause.size ();
-
-    // Update decision heuristics.
-    //
-    if (opts.bump)
-      bump_variables ();
-
-    if (external->learner)
-      external->export_learned_large_clause (clause);
-  } else if (external->learner)
-    external->export_learned_unit_clause (-uip);
-
-  // Update actual size statistics.
-  //
-  stats.units += (size == 1);
-  stats.binaries += (size == 2);
-  UPDATE_AVERAGE (averages.current.size, size);
-
-  // reverse lrat_chain. We could probably work with reversed iterators
-  // (views) to be more efficient but we would have to distinguish in proof
-  //
-  if (lrat) {
-    LOG (unit_chain, "unit chain: ");
-    for (auto id : unit_chain)
-      lrat_chain.push_back (id);
-    unit_chain.clear ();
-    reverse (lrat_chain.begin (), lrat_chain.end ());
+  if (opts.symmetry) {
+    driving_clause = 0;
+  } else {
+    driving_clause = fst_uip_cut();
   }
 
-  // Determine back-jump level, learn driving clause, backtrack and assign
-  // flipped 1st UIP literal.
-  //
-  int jump;
-  Clause *driving_clause = new_driving_clause (glue, jump);
-  UPDATE_AVERAGE (averages.current.jump, jump);
-
-  int new_level = determine_actual_backtrack_level (jump);
-  UPDATE_AVERAGE (averages.current.level, new_level);
-  backtrack (new_level);
-
-  // It should hold that (!level <=> size == 1)
-  //                 and (!uip   <=> size == 0)
-  // this means either we have already learned a clause => size >= 2
-  // in this case we will not learn empty clause or unit here
-  // or we haven't actually learned a clause in new_driving_clause
-  // then lrat_chain is still valid and we will learn a unit or empty clause
-  //
-  if (uip) {
-    search_assign_driving (-uip, driving_clause);
-  } else
-    learn_empty_clause ();
-
-  if (stable)
-    reluctant.tick (); // Reluctant has its own 'conflict' counter.
-
-  // Clean up.
-  //
-  clear_analyzed_literals ();
-  clear_unit_analyzed_literals ();
-  clear_analyzed_levels ();
-  clause.clear ();
-  conflict = 0;
-
-  lrat_chain.clear ();
   STOP (analyze);
 
   if (driving_clause && opts.eagersubsume)

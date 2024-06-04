@@ -649,6 +649,8 @@ struct Internal {
   void otfs_subsume_clause (Clause *subsuming, Clause *subsumed);
   int otfs_find_backtrack_level (int &forced);
   Clause *on_the_fly_strengthen (Clause *conflict, int lit);
+  Clause *fst_uip_cut ();
+  Clause *decision_only_clause ();
   void analyze ();
   void iterate (); // report learned unit clause
 
