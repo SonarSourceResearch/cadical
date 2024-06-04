@@ -850,8 +850,92 @@ void Internal::otfs_strengthen_clause (Clause *c, int lit, int new_size,
 
 /*------------------------------------------------------------------------*/
 
-// Analyze 1st UIP cut
+Clause *Internal::decision_only_clause () {
+  // assert (conflict);
+  assert (clause.empty ());
+  assert (lrat_chain.empty ());
 
+  assert ((int) control.size () == level + 1);
+
+  for (int i = level; i >= 1; i--) {
+    clause.push_back (-control[i].decision);
+  }
+
+  int size = (int) clause.size ();
+  const int glue = size - 1;
+  LOG (clause, "decision-only size %d and glue %d clause", size, glue);
+  UPDATE_AVERAGE (averages.current.glue.fast, glue);
+  UPDATE_AVERAGE (averages.current.glue.slow, glue);
+  stats.learned.literals += size;
+  stats.learned.clauses++;
+
+  if (size > 1) {
+    // Update decision heuristics.
+    //
+    if (opts.bump)
+      bump_variables ();
+
+    if (external->learner)
+      external->export_learned_large_clause (clause); 
+  } else if (external->learner)
+    external->export_learned_unit_clause (clause[0]);
+
+  // Update actual size statistics.
+  //
+  stats.units += (size == 1);
+  stats.binaries += (size == 2);
+  UPDATE_AVERAGE (averages.current.size, size);
+
+  // reverse lrat_chain. We could probably work with reversed iterators
+  // (views) to be more efficient but we would have to distinguish in proof
+  //
+  if (lrat) {
+    LOG (unit_chain, "unit chain: ");
+    for (auto id : unit_chain)
+      lrat_chain.push_back (id);
+    unit_chain.clear ();
+    reverse (lrat_chain.begin (), lrat_chain.end ());
+  }
+
+  // Determine back-jump level, learn driving clause, backtrack and assign
+  // flipped last decision literal.
+  //
+  int jump;
+  Clause *driving_clause = new_driving_clause (glue, jump);
+  UPDATE_AVERAGE (averages.current.jump, jump);
+
+  int new_level = determine_actual_backtrack_level (jump);
+  UPDATE_AVERAGE (averages.current.level, new_level);
+  backtrack (new_level);
+
+  // It should hold that (!level <=> size == 1)
+  //                 and (!uip   <=> size == 0)
+  // this means either we have already learned a clause => size >= 2
+  // in this case we will not learn empty clause or unit here
+  // or we haven't actually learned a clause in new_driving_clause
+  // then lrat_chain is still valid and we will learn a unit or empty clause
+  //
+  if (size > 0) {
+    search_assign_driving (clause[0], driving_clause);
+  } else
+    learn_empty_clause ();
+
+  if (stable)
+    reluctant.tick (); // Reluctant has its own 'conflict' counter.
+
+  // Clean up.
+  //
+  clear_analyzed_literals ();
+  clear_unit_analyzed_literals ();
+  clause.clear ();
+  conflict = 0;
+
+  lrat_chain.clear ();
+
+  return driving_clause;
+}
+
+// Analyze 1st UIP cut and return it as the driving clause
 Clause *Internal::fst_uip_cut () {
 
   // First derive the 1st UIP clause by going over literals assigned on the
@@ -970,7 +1054,7 @@ Clause *Internal::fst_uip_cut () {
   LOG ("first UIP %d", uip);
   clause.push_back (-uip);
 
-    // Update glue and learned (1st UIP literals) statistics.
+  // Update glue and learned (1st UIP literals) statistics.
   //
   int size = (int) clause.size ();
   const int glue = (int) levels.size () - 1;
@@ -996,8 +1080,6 @@ Clause *Internal::fst_uip_cut () {
       shrink_and_minimize_clause ();
     else if (opts.minimize)
       minimize_clause ();
-
-    size = (int) clause.size ();
 
     // Update decision heuristics.
     //
@@ -1167,9 +1249,9 @@ void Internal::analyze () {
   Clause *driving_clause;
 
   if (opts.symmetry) {
-    driving_clause = 0;
+    driving_clause = decision_only_clause ();
   } else {
-    driving_clause = fst_uip_cut();
+    driving_clause = fst_uip_cut ();
   }
 
   STOP (analyze);
