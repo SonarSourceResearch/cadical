@@ -1116,7 +1116,7 @@ class Learner {
 public:
   virtual ~Learner () {}
   virtual bool learning (int size) = 0;
-  virtual void learn (int lit) = 0;
+  virtual void learn (int lit, const std::vector<int>& trail) = 0;
 };
 
 // Connected listener gets notified whenever the truth value of a variable is

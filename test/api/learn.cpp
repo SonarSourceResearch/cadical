@@ -24,7 +24,7 @@ public:
     (void) size;
     return true;
   }
-  void learn (int lit) {
+  void learn (int lit, const std::vector<int>& trail) {
     if (lit)
       clause.push_back (lit);
     else {

@@ -32,7 +32,7 @@ struct Wrapper : Learner, Terminator {
     return size <= learner.max_length;
   }
 
-  void learn (int lit) {
+  void learn (int lit, const std::vector<int>& trail) {
     if (learner.end_clause == learner.capacity_clause) {
       size_t count = learner.end_clause - learner.begin_clause;
       size_t size = count ? 2 * count : 1;
